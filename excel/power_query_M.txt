@@ -1,0 +1,130 @@
+// =====================================================================
+// C1. Power Query — код запросов (Данные -> Получить данные -> Пустой запрос ->
+//     Расширенный редактор). Создать запросы с указанными именами.
+// =====================================================================
+
+// ---------- Запрос: pPath (параметр — папка с CSV) ----------
+"C:\TestTask\data\" meta [IsParameterQuery=true, Type="Text", IsParameterQueryRequired=true]
+
+
+// ---------- Запрос: fnLoadCsv (функция загрузки «грязного» CSV) ----------
+// Разделитель «;», UTF-8 (для cp1251 поменять 65001 -> 1251), заголовки,
+// trim/clean всех текстовых полей, нормализация имён колонок в нижний регистр.
+(fileName as text) as table =>
+let
+    Source   = Csv.Document(File.Contents(pPath & fileName),
+                 [Delimiter = ";", Encoding = 65001, QuoteStyle = QuoteStyle.Csv]),
+    Headers  = Table.PromoteHeaders(Source, [PromoteAllScalars = true]),
+    LowerCol = Table.TransformColumnNames(Headers, each Text.Lower(Text.Trim(_))),
+    Cleaned  = Table.TransformColumns(LowerCol, {}, each if _ is text then Text.Trim(Text.Clean(_)) else _)
+in
+    Cleaned
+
+
+// ---------- Запрос: fnRuNumber (русское число -> Number, пусто/мусор -> 0) ----------
+(t as nullable text) as number =>
+let
+    s   = if t = null then "" else Text.Remove(t, {" ", "#(00A0)", "#(202F)"}),  // пробелы-разряды
+    n   = try Number.FromText(s, "ru-RU") otherwise null                          // запятая-десятичная
+in
+    if n = null then 0 else n
+
+
+// ---------- Запрос: Regiony ----------
+let
+    Src   = fnLoadCsv("regiony.csv"),            // region_kod; region_name; fed_okrug
+    // код региона — текст из 2 знаков (не число!): «05» не должен стать «5»
+    Kod   = Table.TransformColumns(Src, {{"region_kod", each Text.PadStart(_, 2, "0"), type text},
+                                         // регистр в справочнике «грязный»: МОСКОВСКАЯ ОБЛАСТЬ
+                                         {"region_name", each if _ = Text.Upper(_) then Text.Upper(Text.Start(_,1)) & Text.Lower(Text.Middle(_,1)) else _, type text}}),
+    Dedup = Table.Distinct(Kod, {"region_kod"})
+in
+    Dedup
+
+
+// ---------- Запрос: KbkRef ----------
+let
+    Src   = fnLoadCsv("kbk_ref.csv"),
+    Kbk   = Table.TransformColumns(Src, {{"kbk", each Text.Remove(_, {" "}), type text},
+                                         {"priznak_nalog", Text.Upper, type text}}),
+    Dedup = Table.Distinct(Kbk, {"kbk"})
+in
+    Dedup
+
+
+// ---------- Запрос: Nachisleniya ----------
+let
+    Src0    = fnLoadCsv("nachisleniya_raw.csv"), // id; inn; kbk; period; summa_nachisleno; data_operacii
+    Src     = Table.RenameColumns(Src0, {{"summa_nachisleno", "summa"}, {"data_operacii", "data_oper"}}),
+    Inn     = Table.TransformColumns(Src, {
+                {"inn",  each Text.PadStart(Text.Select(_, {"0".."9"}), 10, "0"), type text},
+                {"kbk",  each Text.Remove(_, {" "}), type text},
+                {"summa", fnRuNumber, type number}}),
+    DateT   = Table.TransformColumnTypes(Inn, {{"data_oper", type date}}, "ru-RU"),
+    Dedup   = Table.Distinct(DateT),                         // полные дубли ПОСЛЕ нормализации
+    Region  = Table.AddColumn(Dedup, "region_kod", each Text.Start([inn], 2), type text),
+    Typ     = Table.AddColumn(Region, "vid", each "Начислено", type text)
+in
+    Typ
+
+
+// ---------- Запрос: Postupleniya ----------
+let
+    Src0    = fnLoadCsv("postupleniya_raw.csv"), // id; inn; kbk; period; summa_oplacheno; data_platezha
+    Src     = Table.RenameColumns(Src0, {{"summa_oplacheno", "summa"}, {"data_platezha", "data_plat"}}),
+    Inn     = Table.TransformColumns(Src, {
+                {"inn",  each Text.PadStart(Text.Select(_, {"0".."9"}), 10, "0"), type text},
+                {"kbk",  each Text.Remove(_, {" "}), type text},
+                {"summa", fnRuNumber, type number}}),          // пустая сумма -> 0
+    DateT   = Table.TransformColumnTypes(Inn, {{"data_plat", type date}}, "ru-RU"),
+    Dedup   = Table.Distinct(DateT),
+    Region  = Table.AddColumn(Dedup, "region_kod", each Text.Start([inn], 2), type text)
+in
+    Region
+
+
+// ---------- Запрос: Nedoimka (итоговая таблица -> загрузить на лист) ----------
+// Агрегируем начисления и оплаты ОТДЕЛЬНО по ИНН, затем Full Outer Join агрегатов —
+// иначе merge «многие-ко-многим» размножит суммы.
+let
+    TaxKbk  = Table.SelectRows(KbkRef, each [priznak_nalog] = "Y")[kbk],
+
+    N       = Table.SelectRows(Nachisleniya, each List.Contains(TaxKbk, [kbk])),
+    NAgg    = Table.Group(N, {"inn"}, {{"nachisleno", each List.Sum([summa]), type number}}),
+
+    P       = Table.SelectRows(Postupleniya, each List.Contains(TaxKbk, [kbk])),
+    PAgg    = Table.Group(P, {"inn"}, {{"oplacheno", each List.Sum([summa]), type number}}),
+
+    J       = Table.NestedJoin(NAgg, {"inn"}, PAgg, {"inn"}, "p", JoinKind.FullOuter),
+    JX      = Table.ExpandTableColumn(J, "p", {"inn", "oplacheno"}, {"inn_p", "oplacheno"}),
+    InnAll  = Table.AddColumn(JX, "inn_all", each if [inn] = null then [inn_p] else [inn], type text),
+    Sel     = Table.SelectColumns(InnAll, {"inn_all", "nachisleno", "oplacheno"}),
+    Ren     = Table.RenameColumns(Sel, {{"inn_all", "inn"}}),
+    Nulls   = Table.ReplaceValue(Ren, null, 0, Replacer.ReplaceValue, {"nachisleno", "oplacheno"}),
+    Ned     = Table.AddColumn(Nulls, "nedoimka", each [nachisleno] - [oplacheno], type number),
+    Reg     = Table.AddColumn(Ned, "region_kod", each Text.Start([inn], 2), type text),
+    JR      = Table.NestedJoin(Reg, {"region_kod"}, Regiony, {"region_kod"}, "r", JoinKind.LeftOuter),
+    JRX     = Table.ExpandTableColumn(JR, "r", {"region_name", "fed_okrug"}, {"region_name", "fed_okrug"}),
+    Dolg    = Table.AddColumn(JRX, "dolg", each List.Max({[nedoimka], 0}), type number), // недоимка без переплат
+    Sorted  = Table.Sort(Dolg, {{"nedoimka", Order.Descending}})
+in
+    Sorted
+
+
+// ---------- Запрос: NachTax (для СУММЕСЛИМН на листе формул; загрузить на лист) ----------
+// Длинная таблица «вид / ИНН / регион / КБК / признак / сумма» по начислениям и оплатам.
+let
+    N  = Table.AddColumn(Table.SelectColumns(Nachisleniya, {"inn","kbk","summa","region_kod"}), "vid", each "N", type text),
+    P0 = Table.SelectColumns(Postupleniya, {"inn","kbk","summa","region_kod"}),
+    P  = Table.AddColumn(P0, "vid", each "P", type text),
+    U  = Table.Combine({N, P}),
+    J  = Table.NestedJoin(U, {"kbk"}, KbkRef, {"kbk"}, "k", JoinKind.LeftOuter),
+    JX = Table.ExpandTableColumn(J, "k", {"priznak_nalog"}, {"priznak_nalog"})
+in
+    JX
+
+// Замечания:
+//  * Имена колонок соответствуют заголовкам присланных CSV (UTF-8 с BOM, CRLF).
+//  * Дубли: Table.Distinct по всем колонкам после нормализации -> начисления −8, поступления −5
+//    (id у дублей совпадает, т.е. это именно повторы строк выгрузки).
+//  * Контроль: итог Nedoimka — начислено 719 920 162,00; оплачено 404 795 826,81.
